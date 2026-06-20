@@ -64,7 +64,7 @@ function normalRandom(): number {
   return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v)
 }
 
-function runMC(scenario: MCScenario, n: number): MCResult {
+export function runMC(scenario: MCScenario, n: number): MCResult {
   const samples: number[] = []
   const convergence: number[] = []
 
@@ -317,7 +317,7 @@ export const useMCStore = defineStore('mc', () => {
     convergenceData, histogramData,
     strata, stratifiedResult, isStratifiedRunning,
     stratifiedConvergenceData, stratifiedHistogramData,
-    runSimulation, runTest, setScenario,
+    runSimulation, runTest, setScenario, runMC,
     addStratum, removeStratum, updateStratum, runStratifiedSimulation
   }
 })
