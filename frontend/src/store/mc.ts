@@ -28,6 +28,35 @@ export interface HypTestResult {
   df?: number
 }
 
+export interface StratumConfig {
+  id: string
+  name: string
+  scenarioId: string
+  weight: number
+  sampleSize: number
+  params: Record<string, number>
+}
+
+export interface StratumResult {
+  stratumId: string
+  stratumName: string
+  weight: number
+  sampleSize: number
+  estimate: number
+  variance: number
+  stdError: number
+  samples: number[]
+  convergence: number[]
+}
+
+export interface StratifiedResult {
+  overallEstimate: number
+  overallVariance: number
+  overallStdError: number
+  totalSamples: number
+  strata: StratumResult[]
+}
+
 function normalRandom(): number {
   let u = 0, v = 0
   while (u === 0) u = Math.random()
@@ -97,6 +126,67 @@ function runMC(scenario: MCScenario, n: number): MCResult {
   return { scenario: 'gambler', iterations: n, estimate: ruinCount / n, samples, convergence }
 }
 
+function computeVariance(samples: number[], mean: number): number {
+  if (samples.length < 2) return 0
+  return samples.reduce((s, x) => s + (x - mean) ** 2, 0) / (samples.length - 1)
+}
+
+function getScenarioById(id: string): MCScenario | undefined {
+  return SCENARIOS.find(s => s.id === id)
+}
+
+function runStratum(stratum: StratumConfig): StratumResult {
+  const scenario = getScenarioById(stratum.scenarioId)
+  if (!scenario) {
+    return {
+      stratumId: stratum.id,
+      stratumName: stratum.name,
+      weight: stratum.weight,
+      sampleSize: 0,
+      estimate: 0,
+      variance: 0,
+      stdError: 0,
+      samples: [],
+      convergence: []
+    }
+  }
+  const mergedParams = { ...scenario.params, ...stratum.params }
+  const mcResult = runMC({ ...scenario, params: mergedParams }, stratum.sampleSize)
+  const variance = computeVariance(mcResult.samples, mcResult.estimate)
+  return {
+    stratumId: stratum.id,
+    stratumName: stratum.name,
+    weight: stratum.weight,
+    sampleSize: stratum.sampleSize,
+    estimate: mcResult.estimate,
+    variance,
+    stdError: Math.sqrt(variance / stratum.sampleSize),
+    samples: mcResult.samples,
+    convergence: mcResult.convergence
+  }
+}
+
+function runStratifiedSampling(strata: StratumConfig[]): StratifiedResult {
+  const stratumResults = strata.map(s => runStratum(s))
+  const totalWeight = stratumResults.reduce((sum, s) => sum + s.weight, 0)
+  let overallEstimate = 0
+  let overallVariance = 0
+  let totalSamples = 0
+  stratumResults.forEach(s => {
+    const w = totalWeight > 0 ? s.weight / totalWeight : 0
+    overallEstimate += w * s.estimate
+    overallVariance += w * w * (s.variance / s.sampleSize)
+    totalSamples += s.sampleSize
+  })
+  return {
+    overallEstimate,
+    overallVariance,
+    overallStdError: Math.sqrt(overallVariance),
+    totalSamples,
+    strata: stratumResults
+  }
+}
+
 export const SCENARIOS: MCScenario[] = [
   { id: 'pi', name: '圆周率π估算', description: '随机投点估算π值，观察收敛过程', params: {}, category: '基础' },
   { id: 'brownian', name: '布朗运动模拟', description: '粒子热运动随机路径模拟', params: { dt: 0.01 }, category: '物理' },
@@ -106,12 +196,21 @@ export const SCENARIOS: MCScenario[] = [
   { id: 'gambler', name: '赌徒破产', description: '不利赌局下资金耗尽概率估算', params: { p: 0.45, bankroll: 50, goal: 100 }, category: '概率' }
 ]
 
+export const DEFAULT_STRATA: StratumConfig[] = [
+  { id: 'stratum-1', name: '层1 - 低价期权', scenarioId: 'option', weight: 0.4, sampleSize: 500, params: { S0: 90, K: 100, r: 0.05, sigma: 0.15, T: 1 } },
+  { id: 'stratum-2', name: '层2 - 平价期权', scenarioId: 'option', weight: 0.35, sampleSize: 500, params: { S0: 100, K: 100, r: 0.05, sigma: 0.2, T: 1 } },
+  { id: 'stratum-3', name: '层3 - 高价期权', scenarioId: 'option', weight: 0.25, sampleSize: 500, params: { S0: 115, K: 100, r: 0.05, sigma: 0.3, T: 1 } }
+]
+
 export const useMCStore = defineStore('mc', () => {
   const currentScenario = ref<MCScenario>(SCENARIOS[0])
   const iterations = ref(1000)
   const result = ref<MCResult | null>(null)
   const testResult = ref<HypTestResult | null>(null)
   const isRunning = ref(false)
+  const strata = ref<StratumConfig[]>([...DEFAULT_STRATA])
+  const stratifiedResult = ref<StratifiedResult | null>(null)
+  const isStratifiedRunning = ref(false)
 
   function runSimulation() {
     isRunning.value = true
@@ -148,5 +247,77 @@ export const useMCStore = defineStore('mc', () => {
     return { xAxis: Array.from({ length: bins }, (_, i) => Math.round((mn + i * bs) * 100) / 100), data: counts }
   })
 
-  return { currentScenario, iterations, result, testResult, isRunning, convergenceData, histogramData, runSimulation, runTest, setScenario }
+  function addStratum() {
+    const id = `stratum-${Date.now()}`
+    const scenario = SCENARIOS[0]
+    strata.value.push({
+      id,
+      name: `新层 ${strata.value.length + 1}`,
+      scenarioId: scenario.id,
+      weight: 1 / (strata.value.length + 1),
+      sampleSize: 500,
+      params: { ...scenario.params }
+    })
+    normalizeWeights()
+  }
+
+  function removeStratum(id: string) {
+    strata.value = strata.value.filter(s => s.id !== id)
+    normalizeWeights()
+  }
+
+  function updateStratum(id: string, updates: Partial<StratumConfig>) {
+    const stratum = strata.value.find(s => s.id === id)
+    if (stratum) {
+      Object.assign(stratum, updates)
+    }
+  }
+
+  function normalizeWeights() {
+    const total = strata.value.reduce((sum, s) => sum + s.weight, 0)
+    if (total > 0) {
+      strata.value.forEach(s => { s.weight = Math.round((s.weight / total) * 1000) / 1000 })
+    }
+  }
+
+  function runStratifiedSimulation() {
+    isStratifiedRunning.value = true
+    setTimeout(() => {
+      stratifiedResult.value = runStratifiedSampling(strata.value)
+      isStratifiedRunning.value = false
+    }, 10)
+  }
+
+  const stratifiedConvergenceData = computed(() => {
+    if (!stratifiedResult.value) return [] as { name: string; data: [number, number][] }[]
+    return stratifiedResult.value.strata.map(s => ({
+      name: s.stratumName,
+      data: s.convergence.slice(0, 200).map((v, i): [number, number] => [i, Math.round(v * 100000) / 100000])
+    }))
+  })
+
+  const stratifiedHistogramData = computed(() => {
+    if (!stratifiedResult.value) return [] as { name: string; xAxis: number[]; data: number[] }[]
+    return stratifiedResult.value.strata.map(s => {
+      const samples = s.samples.slice(0, 500)
+      const mn = Math.min(...samples), mx = Math.max(...samples)
+      const bins = 20, bs = (mx - mn) / bins || 1
+      const counts = new Array(bins).fill(0)
+      samples.forEach(v => { counts[Math.min(bins - 1, Math.floor((v - mn) / bs))]++ })
+      return {
+        name: s.stratumName,
+        xAxis: Array.from({ length: bins }, (_, i) => Math.round((mn + i * bs) * 100) / 100),
+        data: counts
+      }
+    })
+  })
+
+  return {
+    currentScenario, iterations, result, testResult, isRunning,
+    convergenceData, histogramData,
+    strata, stratifiedResult, isStratifiedRunning,
+    stratifiedConvergenceData, stratifiedHistogramData,
+    runSimulation, runTest, setScenario,
+    addStratum, removeStratum, updateStratum, runStratifiedSimulation
+  }
 })
